@@ -49,7 +49,7 @@ ACME → HTTP（TCP 80）→ /.well-known/acme-challenge/
 - Xray 仅监听回环地址，通过非 root 服务用户运行；私钥与连接信息仅 root 可读，错误日志进入 journald，不开启 Xray 访问日志。
 - 保留原文的私网、`geoip:cn` 和广告域名阻断规则。因此通过该节点访问中国大陆 IP 可能被阻断；如需调整，编辑 Xray 配置后先校验再重启。
 - 安装每天检查证书续期的 systemd timer；证书更新后先执行 `nginx -t`，通过后 reload。
-- 原始 `html.rar` 保存在 [v1.0.0 Release](https://github.com/hss-oss/xray-oneclick/releases/tag/v1.0.0) 的附件中。脚本自动下载同一 Release 内经过整理的 `xray-site.tar.gz`，校验固定的 SHA-256 后，将 `html/` 内的页面、CSS、JS、字体和图片部署到 `/var/www/xray-nginx/`。不需要手动下载附件或安装 RAR 解压软件。
+- 原始 `html.rar` 保存在 [v1.0.0 Release](https://github.com/hss-oss/xray-oneclick/releases/tag/v1.0.0) 的附件中。脚本优先从 GitHub Raw 下载固定 `v1.0.0` 资源，失败时切换至该 Release 的 `xray-site.tar.gz`，校验固定的 SHA-256 后，将 `html/` 内的页面、CSS、JS、字体和图片部署到 `/var/www/xray-nginx/`。不需要手动下载附件或安装 RAR 解压软件。
 - 若脚本同目录已有 `xray-site.tar.gz`，优先使用该文件并执行相同的校验；可用来离线部署站点资源。其他系统组件安装仍需网络。
 - HTTP 和 HTTPS 均使用该站点目录，`index.html` 直接位于目录根部；保留 `.well-known/acme-challenge/`，不影响证书签发及续期。
 - 分发前移除了原模板的 Google Maps API key 及对应加载脚本，保留模板署名和其余页面。原有字体及 OwlCarousel CDN 引用仍按模板保留，网站文件的原编码与换行保持不变。
@@ -121,12 +121,24 @@ bash install-xray.sh --dry-run --domain proxy.example.com --email admin@example.
 
 发生错误时，脚本会保留原始失败退出码，清理自身临时目录，停止本次安装的 Xray 和已经启用的续期 timer，并尝试恢复 Nginx 默认站点。**这不等于完整卸载：已安装软件包、软件源、证书账户和排查文件会保留。** Nginx 的备份是安装官方包后、替换站点前的配置。
 
-脚本再次执行会拒绝覆盖已有文件；应先根据错误和备份处理失败步骤，或在新的干净实例上重试，不要直接删除配置和证书目录。安装过程不更改 SSH、防火墙或系统目录的整体权限。
+默认重跑会拒绝覆盖已有文件。若旧版在“部署 html.rar 站点资源”时因 HTTP 504 等下载错误退出，可使用 v1.0.1 的专用续装入口（替换域名和邮箱）：
+
+```bash
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.0.1/install-xray.sh -o install-xray.sh
+sudo bash install-xray.sh --resume-site-download \
+  --domain proxy.example.com --email admin@example.com
+```
+
+该入口只接受站点下载失败阶段：Nginx 配置必须与原备份完全一致，站点与证书目录为空，尚无 ACME、Xray 或续期配置。检查通过后跳过 apt 和 Nginx 重装，从站点部署继续，保留原备份。存在业务文件或配置改动时会拒绝执行；其他阶段的错误需要单独排查，不要直接删除配置和证书目录。
+
+资源优先走 GitHub Raw，Release 作为备用，两者均校验同一固定 SHA-256。也可把可信的 `xray-site.tar.gz` 放在脚本同目录。下载和校验完成后才替换默认 Nginx 配置；失败清理仅对正在运行的 Nginx reload，避免产生额外的“服务未启动”报错。安装过程不更改 SSH、防火墙或系统目录的整体权限。
 
 ## 验证范围
 
 已完成 Bash 语法检查、ShellCheck、参数校验、失败退出清理测试；生成的配置通过官方 Xray Core `26.10.31` 校验，并通过 Nginx `1.27.5` 的 HTTP/3 与 IPv6 四种配置组合校验。
 
 使用临时端口和测试证书，实际验证了 HTTPS 证书校验、ACME webroot、客户端经 TLS/HTTP2 → Nginx → XHTTP/VLESS 访问公网网页，以及私网阻断规则。新增测试覆盖站点资源逐文件完整性、目录层级、权限、ACME 文件保留、损坏资源拒绝写入，以及 Nginx 实际返回 Photosec 首页、CSS、JS、图片、字体和子页面。测试结束后已停止临时进程。未在真实 Debian/Ubuntu 服务器上执行完整 apt 安装、生产证书签发或定时续期；实际安装会下载届时的官方版本。
+
+新增故障测试覆盖主链路失败自动切换、双链路失败保留退出码及拒绝写入、续装阶段顺序，以及拒绝已有证书、ACME、网站内容、链接或配置改动。已在用户 Ubuntu 24.04 服务器上复现 Release HTTP 504，确认 Raw HTTP 200、资源校验通过，且专用续装前置检查通过。
 
 相关官方项目：[Nginx 软件源](https://nginx.org/en/linux_packages.html)、[Xray-install](https://github.com/XTLS/Xray-install)、[acme.sh](https://github.com/acmesh-official/acme.sh)。

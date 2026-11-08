@@ -3,13 +3,25 @@
 面向尚未安装 Nginx/Xray 的 Debian/Ubuntu 服务器，支持 amd64/arm64 和 systemd。
 
 ```bash
-curl -fL --retry 3 https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.0/install-xray.sh -o install-xray.sh && sudo bash install-xray.sh
+curl -fL --retry 3 https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.1/install-xray.sh -o install-xray.sh && sudo bash install-xray.sh
 ```
 
 - 安装 Nginx mainline、Xray VLESS/XHTTP 和 acme.sh。
 - 自动生成独立 UUID/路径、申请 Let's Encrypt ECC 证书并配置续期。
 - 自动下载站点资源，校验 SHA-256 后部署 Photosec 页面，保留 ACME 验证目录。
 - 安装成功后将 VLESS/XHTTP 链接保存到 `/opt/xray-nginx/client.txt`。
+
+本次修复：
+
+- 针对 GitHub Release HTTP 504，优先使用固定版本的 GitHub Raw 资源，并保留 Release 备用链路和固定 SHA-256 校验。
+- 新增 `--resume-site-download`，可从旧版站点下载失败后的状态续装；严格检查备份一致且未进入证书/Xray 步骤，不覆盖已有业务。
+- 资源校验后才替换默认 Nginx 配置，失败清理仅 reload 运行中的服务。
+
+旧版下载失败的服务器可执行：
+
+```bash
+sudo bash install-xray.sh --resume-site-download --domain proxy.example.com --email admin@example.com
+```
 
 附件：
 

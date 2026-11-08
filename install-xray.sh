@@ -9,7 +9,9 @@ EMAIL=''
 CLIENT_UUID=''
 XHTTP_PATH=''
 DRY_RUN=0
-SITE_URL=https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.0/xray-site.tar.gz
+RESUME_SITE_DOWNLOAD=0
+SITE_URL=https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.0.0/assets/xray-site.tar.gz
+SITE_FALLBACK_URL=https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.0/xray-site.tar.gz
 SITE_SHA256=bc152def1c5e4527809a27eb7fed7802cc4abf19bb99a07cfb15d595bc470202
 BASE=/opt/xray-nginx
 ACME_HOME=$BASE/acme
@@ -33,6 +35,7 @@ usage() {
   --email you@example.com    ACME 注册邮箱
   --uuid UUID               客户端 UUID；默认随机生成
   --path /random-path       XHTTP 路径；默认独立随机生成
+  --resume-site-download    仅续装：上次在站点资源下载阶段失败
   --dry-run                 仅输出配置，不安装、不写文件（需要 python3）
   -h, --help                显示帮助
 
@@ -54,6 +57,7 @@ parse_args() {
           --path) XHTTP_PATH=$2;;
         esac
         shift 2;;
+      --resume-site-download) RESUME_SITE_DOWNLOAD=1; shift;;
       --dry-run) DRY_RUN=1; shift;;
       -h|--help) usage; exit 0;;
       *) die "未知参数：$1（使用 --help 查看用法）";;
@@ -184,7 +188,10 @@ install_site() (
   archive_path=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/xray-site.tar.gz
   if [[ ! -f $archive_path ]]; then
     archive_path=$site_temp/xray-site.tar.gz
-    download "$SITE_URL" "$archive_path"
+    if ! download "$SITE_URL" "$archive_path"; then
+      info 'GitHub Raw 下载失败，改用 Release 中的同版本资源'
+      download "$SITE_FALLBACK_URL" "$archive_path" || return "$?"
+    fi
   fi
   python3 - "$archive_path" "$WEB_ROOT" "$SITE_SHA256" <<'PY'
 import hashlib, io, shutil, sys, tarfile
@@ -240,7 +247,7 @@ cleanup() {
       if [[ -e $BACKUP/default || -L $BACKUP/default ]]; then
         cp -a "$BACKUP/default" /etc/nginx/sites-enabled/default
       fi
-      if nginx -t; then
+      if nginx -t && systemctl is-active --quiet nginx; then
         systemctl reload nginx || true
       fi
     fi
@@ -250,6 +257,54 @@ cleanup() {
   fi
   [[ -z $TEMP_DIR ]] || rm -rf -- "$TEMP_DIR"
   exit "$status"
+}
+
+# 只接受 v1.0.0 在站点下载失败后留下的状态；拒绝已有证书、Xray 或配置改动。
+check_site_download_resume() {
+  command -v nginx >/dev/null || die '续装需要上次已安装的 Nginx'
+  local dependency
+  for dependency in python3 curl openssl gpg unzip ss; do
+    command -v "$dependency" >/dev/null || die "续装缺少依赖：$dependency"
+  done
+  [[ ! -e $XRAY_CONF && ! -e /usr/local/bin/xray && ! -L $XRAY_CONF ]] || die '已存在 Xray，不能使用站点下载续装模式'
+  [[ ! -e /etc/systemd/system/xray-acme-renew.service && ! -L /etc/systemd/system/xray-acme-renew.service && ! -e /etc/systemd/system/xray-acme-renew.timer && ! -L /etc/systemd/system/xray-acme-renew.timer ]] || die '已存在续期配置，不能使用站点下载续装模式'
+  [[ ! -e $ACME_HOME && ! -L $ACME_HOME ]] || die '已进入证书步骤，不能使用站点下载续装模式'
+  python3 - "$BASE" "$CERT_DIR" "$WEB_ROOT" "${NGINX_CONF%/conf.d/*}" <<'PYRESUME'
+import os, sys
+from pathlib import Path
+base, certs, web, nginx = map(Path, sys.argv[1:])
+def reject(message):
+    raise SystemExit('不能安全续装：' + message)
+for path in (base, certs, web, base / 'backup', base / 'backup/nginx', nginx):
+    if path.is_symlink() or not path.is_dir():
+        reject(f'目录缺失或是链接：{path}')
+if {p.name for p in base.iterdir()} != {'backup'}:
+    reject('安装目录中存在其他步骤的文件')
+if any(certs.iterdir()):
+    reject('证书目录非空')
+for path in web.rglob('*'):
+    if path.is_symlink() or not path.is_dir() or path.relative_to(web).as_posix() not in ('.well-known', '.well-known/acme-challenge'):
+        reject('站点目录已有文件或非预期目录')
+def inventory(root):
+    result = {}
+    for path in root.rglob('*'):
+        key = path.relative_to(root).as_posix()
+        if path.is_symlink(): result[key] = ('link', os.readlink(path))
+        elif path.is_file(): result[key] = ('file', path.read_bytes())
+        elif path.is_dir(): result[key] = ('dir',)
+        else: reject(f'不支持的文件类型：{path}')
+    return result
+backup = base / 'backup/nginx'
+if not (backup / 'nginx.conf').is_file() or inventory(backup) != inventory(nginx):
+    reject('当前 Nginx 配置与安装前备份不一致，请先人工检查')
+print('续装检查通过：配置与备份一致，尚未部署站点、证书或 Xray')
+PYRESUME
+  nginx -t
+  local port
+  for port in 443 8443; do
+    [[ -z $(ss -H -ltn "sport = :$port") ]] || die "TCP $port 已被占用"
+  done
+  [[ -z $(ss -H -lun 'sport = :443') ]] || die 'UDP 443 已被占用'
 }
 
 preflight() {
@@ -264,6 +319,10 @@ preflight() {
   command -v flock >/dev/null || die '缺少 flock，请先安装 util-linux'
   exec 9>/run/lock/xray-nginx-install.lock
   flock -n 9 || die '已有安装进程正在运行'
+  if [[ $RESUME_SITE_DOWNLOAD == 1 ]]; then
+    check_site_download_resume
+    return
+  fi
   [[ ! -e $BASE && ! -e $CERT_DIR && ! -e $WEB_ROOT ]] || die "发现已有安装或残留文件，请先检查 $BASE；本脚本不覆盖现有部署"
   [[ ! -e $XRAY_CONF && ! -e /usr/local/bin/xray ]] || die '已安装 Xray；请先备份并人工确认，脚本不覆盖'
   for file in /etc/apt/sources.list.d/xray-nginx.list /etc/apt/preferences.d/xray-nginx \
@@ -325,13 +384,6 @@ EOF
   chmod 644 /etc/apt/preferences.d/xray-nginx
   apt-get -o Acquire::Retries=3 update
   apt-get -o Acquire::Retries=3 install -y nginx
-  local build
-  build=$(nginx -V 2>&1)
-  [[ $build == *--with-http_v2_module* ]] || die 'Nginx 未编译 HTTP/2 支持'
-  HTTP3=0
-  [[ $build != *--with-http_v3_module* ]] || HTTP3=1
-  IPV6=0
-  if [[ -r /proc/net/if_inet6 ]] && grep -q . /proc/net/if_inet6; then IPV6=1; fi
   install -d -m 700 "$BASE" "$CERT_DIR" "$BASE/backup"
   BACKUP=$BASE/backup
   cp -a /etc/nginx "$BACKUP/nginx"
@@ -339,10 +391,22 @@ EOF
   if [[ -e /etc/nginx/sites-enabled/default || -L /etc/nginx/sites-enabled/default ]]; then
     cp -a /etc/nginx/sites-enabled/default "$BACKUP/default"
   fi
-  NGINX_CHANGED=1
-  rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default
+  configure_nginx_site
+}
+
+configure_nginx_site() {
+  local build
+  build=$(nginx -V 2>&1)
+  [[ $build == *--with-http_v2_module* ]] || die 'Nginx 未编译 HTTP/2 支持'
+  HTTP3=0
+  [[ $build != *--with-http_v3_module* ]] || HTTP3=1
+  IPV6=0
+  if [[ -r /proc/net/if_inet6 ]] && grep -q . /proc/net/if_inet6; then IPV6=1; fi
+  # 下载和校验完成后才替换默认配置，网络失败时保留当前配置。
   install -d -m 755 "$WEB_ROOT" "$WEB_ROOT/.well-known" "$WEB_ROOT/.well-known/acme-challenge"
   install_site
+  NGINX_CHANGED=1
+  rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default
   render_nginx 0 > "$NGINX_CONF"
   chmod 644 "$NGINX_CONF"
   nginx -t
@@ -448,8 +512,13 @@ main() {
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  install_dependencies
-  install_nginx
+  if [[ $RESUME_SITE_DOWNLOAD == 1 ]]; then
+    BACKUP=$BASE/backup
+    configure_nginx_site
+  else
+    install_dependencies
+    install_nginx
+  fi
   install_certificate
   install_xray
   render_nginx 1 "$HTTP3" "$IPV6" > "$NGINX_CONF"
