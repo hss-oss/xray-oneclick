@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='xray-chroot-tests-') as scratch:
    if Path(lib).is_file():
     dest=runtime/lib.lstrip('/');dest.parent.mkdir(parents=True,exist_ok=True)
     if not dest.exists():shutil.copy2(Path(lib).resolve(),dest)
- for name in ['/bin/bash','/bin/sh','/usr/bin/python3','/usr/bin/uname','/usr/bin/flock','/usr/bin/mktemp','/usr/bin/tar','/usr/bin/gzip','/usr/bin/install','/usr/bin/mkdir','/usr/bin/cp','/usr/bin/rm']:
+ for name in ['/bin/bash','/bin/sh','/usr/bin/python3','/usr/bin/uname','/usr/bin/flock','/usr/bin/mktemp','/usr/bin/tar','/usr/bin/tee','/usr/bin/grep','/usr/bin/diff','/usr/bin/gzip','/usr/bin/install','/usr/bin/mkdir','/usr/bin/cp','/usr/bin/rm']:
   copy_runtime(name)
  stdlib=Path('/usr/lib')/f'python{sys.version_info.major}.{sys.version_info.minor}'
  shutil.copytree(stdlib,runtime/str(stdlib).lstrip('/'),dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','site-packages','dist-packages'))
@@ -25,6 +25,8 @@ with tempfile.TemporaryDirectory(prefix='xray-chroot-tests-') as scratch:
  def write(root,name,text,mode=0o644):
   p=root/name.lstrip('/');p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text);p.chmod(mode);return p
  def mock(name,body):write(runtime,'/usr/bin/'+name,'#!/bin/bash\nset -eu\n'+body,0o755)
+ mock('ss','exit 0\n')
+ mock('nginx','exit 0\n')
  mock('dpkg','printf "amd64\\n"\n')
  mock('dpkg-query','printf "installed"\n')
  mock('systemctl','''printf 'systemctl %s\\n' "$*" >> /test-events
@@ -123,6 +125,30 @@ rm -rf /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray /var/log/xr
  assert (root/'opt/xray-nginx/client.txt').exists()
  result=execute(root,'--uninstall','--domain','example.com');assert result.returncode!=0
  print('PASS: 拒绝链接目录和冲突参数；备份失败时不停止服务或删除文件',flush=True)
+ root=setup('resume-xray')
+ (root/'usr/local/bin/xray').unlink();shutil.rmtree(root/'usr/local/etc/xray')
+ (root/'etc/systemd/system/xray-acme-renew.timer').unlink()
+ (root/'etc/nginx/conf.d/xray-nginx.conf').unlink()
+ shutil.copy2(root/'opt/xray-nginx/backup/nginx/conf.d/default.conf',root/'etc/nginx/conf.d/default.conf')
+ write(root,'/opt/xray-nginx/acme/acme.sh','fixture')
+ write(root,'/usr/local/ssl/xray-nginx/fullchain.pem','certificate fixture')
+ result=run(['chroot',str(root),'/bin/bash','-c','source /install-xray.sh; check_xray_resume'])
+ assert result.returncode==0,result.stdout+result.stderr
+ write(root,'/etc/nginx/conf.d/other.conf','other site')
+ result=run(['chroot',str(root),'/bin/bash','-c','source /install-xray.sh; check_xray_resume'])
+ assert result.returncode!=0
+ print('PASS: 接受证书已签发但Xray未安装的续装状态；拒绝额外Nginx配置',flush=True)
+ root=setup('generic-resume')
+ result=run(['chroot',str(root),'/bin/bash','-c','source /install-xray.sh; check_resume'])
+ assert result.returncode==0,result.stdout+result.stderr
+ write(root,'/opt/xray-nginx/install-state.json','{"managed_by":"another-installer"}')
+ result=run(['chroot',str(root),'/bin/bash','-c','source /install-xray.sh; check_resume'])
+ assert result.returncode!=0
+ (root/'opt/xray-nginx/install-state.json').unlink()
+ write(root,'/etc/nginx/conf.d/other.conf','other site')
+ result=run(['chroot',str(root),'/bin/bash','-c','source /install-xray.sh; check_resume'])
+ assert result.returncode!=0
+ print('PASS: 通用续装识别旧版备份，拒绝其他安装器状态和额外站点',flush=True)
  root=setup('official-install')
  script='source /install-xray.sh; TEMP_DIR=/tmp; mkdir -p /tmp; BASE=/opt/xray-nginx; install_xray'
  result=run(['chroot',str(root),'/bin/bash','-c',script]);assert result.returncode==77,result.stdout+result.stderr

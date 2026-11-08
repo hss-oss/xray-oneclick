@@ -44,7 +44,7 @@ ACME → HTTP（TCP 80）→ /.well-known/acme-challenge/
 ```
 
 - Nginx 从官方 mainline 仓库安装，并核对官方签名密钥指纹。根据编译模块和系统 IPv6 状态生成配置。
-- Xray 使用 XTLS 官方 `install-release.sh` 的默认在线 `install` 流程，由官方脚本自动识别架构、选择稳定版、下载并校验安装包、安装 Xray 和 geodata。封装仅增加 `--manually-restart-later`，待 XHTTP 配置校验通过后统一启动；acme.sh 使用官方源码，申请 Let's Encrypt ECC 证书。
+- Xray 优先执行 XTLS 官方 `install-release.sh` 的在线 `install`，由官方选择版本、架构并下载校验；脚本入口失败时通过 Raw 获取同一安装器，在线安装遇到下载错误才通过官方 API 获取安装包、核对官方 SHA-256 后调用 `--local`。校验或权限等非下载错误直接停止。使用 `--manually-restart-later`，配置检查通过后启动；acme.sh 使用官方源码，申请 Let's Encrypt ECC 证书。
 - UUID 与 XHTTP 路径分别随机生成，不复用原文中的示例凭据。可用 `--uuid`、`--path` 指定自己的值。
 - Xray 仅监听回环地址，通过非 root 服务用户运行；私钥与连接信息仅 root 可读，错误日志进入 journald，不开启 Xray 访问日志。
 - 保留原文的私网、`geoip:cn` 和广告域名阻断规则。因此通过该节点访问中国大陆 IP 可能被阻断；如需调整，编辑 Xray 配置后先校验再重启。
@@ -112,7 +112,7 @@ sudo systemctl reload nginx
 **以下命令会停止并移除这套部署，包括 Nginx、Xray、站点、证书和续期任务。** 已有连接会中断。先获取新版脚本：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.1.0/install-xray.sh -o install-xray.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.2.0/install-xray.sh -o install-xray.sh
 ```
 
 可先预览移除检查与操作范围：
@@ -147,15 +147,33 @@ bash install-xray.sh --dry-run --domain proxy.example.com --email admin@example.
 
 发生错误时，脚本会保留原始失败退出码，清理自身临时目录，停止本次安装的 Xray 和已经启用的续期 timer，并尝试恢复 Nginx 默认站点。**这不等于完整卸载：已安装软件包、软件源、证书账户和排查文件会保留。** Nginx 的备份是安装官方包后、替换站点前的配置。
 
-默认重跑会拒绝覆盖已有文件。若旧版在“部署 html.rar 站点资源”时因 HTTP 504 等下载错误退出，可使用 v1.1.0 的专用续装入口（替换域名和邮箱）：
+默认重跑仍会拒绝覆盖已有部署。中断后使用通用续装入口：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.1.0/install-xray.sh -o install-xray.sh
-sudo bash install-xray.sh --resume-site-download \
-  --domain proxy.example.com --email admin@example.com
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.2.0/install-xray.sh -o install-xray.sh
+sudo bash install-xray.sh --resume
 ```
 
-该入口只接受站点下载失败阶段：Nginx 配置必须与原备份完全一致，站点与证书目录为空，尚无 ACME、Xray 或续期配置。检查通过后跳过 apt 和 Nginx 重装，从站点部署继续，保留原备份。存在业务文件或配置改动时会拒绝执行；其他阶段的错误需要单独排查，不要直接删除配置和证书目录。
+新版本在依赖完成后开始保存 `/opt/xray-nginx/install-state.json`（权限 `0600`），包含域名、邮箱、UUID、XHTTP 路径和最后完成阶段；后续 `--resume` 自动读取参数，不会重新随机生成 UUID 或路径。不允许通过续装意外切换域名/UUID/路径。状态记录以临时文件原子替换，避免中断后留下半份 JSON。
+
+续装检查实际文件、证书和配置，而不只相信阶段标记：
+
+| 阶段 | 续装行为 |
+| --- | --- |
+| 系统依赖 | 已具备所需命令则复用，缺少依赖才安装；若尚无任何部署文件则从初始步骤开始 |
+| Nginx 与站点 | 复用已安装软件和通过检查的配置/站点；缺失时补装，不覆盖原始备份；已校验的站点包缓存在安装目录 |
+| 证书 | 检查剩余有效期、域名和证书/私钥匹配；有效且有 ACME 账户时复用，不重复签发 |
+| Xray | 程序、geodata、unit 具备时复用；配置一致且服务正常则不重启。未装全则修复安装，在线下载错误自动触发 API 备用 |
+| HTTPS | 重新检查配置、reload，并使用完整证书校验测试本机 HTTPS |
+| 续期与连接信息 | 补齐 systemd timer 和客户端链接，记录 complete |
+
+依赖安装失败且还未产生状态文件时，`--resume` 会从初始步骤开始，需要再次提供域名和邮箱。旧版部署没有进度 JSON 时，必须保有本脚本的原始 Nginx 备份，并显式提供域名/邮箱：
+
+```bash
+sudo bash install-xray.sh --resume --domain proxy.example.com --email admin@example.com
+```
+
+旧版已生成 Xray 配置时会从中保留 UUID 和路径。发现其他站点、其他 Xray 配置/实例、修改过的 Nginx 主配置或链接目录时停止，避免覆盖其他业务。专用的 `--resume-site-download` 和 `--resume-xray` 保留兼容；推荐使用统一 `--resume`。卸载后的恢复需要先人工取回备份中的配置/证书，不会自动还原任意卸载归档。
 
 资源优先走 GitHub Raw，Release 作为备用，两者均校验同一固定 SHA-256。也可把可信的 `xray-site.tar.gz` 放在脚本同目录。下载和校验完成后才替换默认 Nginx 配置；失败清理仅对正在运行的 Nginx reload，避免产生额外的“服务未启动”报错。安装过程不更改 SSH、防火墙或系统目录的整体权限。
 
@@ -167,9 +185,13 @@ sudo bash install-xray.sh --resume-site-download \
 
 新增故障测试覆盖主链路失败自动切换、双链路失败保留退出码及拒绝写入、续装阶段顺序，以及拒绝已有证书、ACME、网站内容、链接或配置改动。已在用户 Ubuntu 24.04 服务器上复现 Release HTTP 504，确认 Raw HTTP 200、资源校验通过，且专用续装前置检查通过。
 
-v1.1.0 恢复官方默认在线安装，移除封装层的 Xray API 选包、下载、摘要校验及 `--local` 安装逻辑。官方安装脚本先下载到临时文件，HTTP 下载失败或 Bash 语法检查失败时停止，避免将错误页面作为脚本执行。保留官方安装器退出码；后续配置校验通过后再启用服务。已验证官方脚本及安装包地址恢复可用；已有生产服务不重复安装。
+已验证官方在线下载失败后自动切换 API 备用，并核对官方 SHA-256；正常在线安装不会调用备用，校验/权限错误不会被当作网络故障绕过。通用续装测试覆盖 Xray 失败后保留证书阶段、下一次完成后续步骤、UUID/路径保持一致、状态文件权限和参数冲突拒绝。
+
+已在真实 Ubuntu 部署中复用卸载备份中的证书完成恢复；再次执行 `--resume` 时，依赖、Nginx、证书和 Xray 均复用，证书指纹和客户端连接文件完全一致。
 
 新增移除功能已在真实 Ubuntu 的隔离 chroot 中验证完整移除、备份内容与权限、无写入预览、重复移除、旧版兼容、网络/apt 失败和共享资源保护；apt、systemd 与官方卸载器在该隔离测试中使用替身，真实 tar 和文件清理在隔离目录执行。已在现有生产部署上完成只读移除预览，未执行生产卸载。
+
+普通回归测试：`python3 tests/test_official_first.py`、`python3 tests/test_xray_download.py`、`python3 tests/test_resume.py`。
 
 可在 Linux 上以 root 运行隔离回归测试：`sudo python3 tests/test_uninstall.py`。测试为 systemd、apt 和官方卸载器提供替身，所有删除发生在临时 chroot 内，不操作宿主服务。
 
