@@ -44,7 +44,7 @@ ACME → HTTP（TCP 80）→ /.well-known/acme-challenge/
 ```
 
 - Nginx 从官方 mainline 仓库安装，并核对官方签名密钥指纹。根据编译模块和系统 IPv6 状态生成配置。
-- Xray 从官方 API 选择架构对应的稳定版安装包，核对官方 Release 元数据中的 SHA-256，使用 XTLS 官方安装脚本的 `--local` 模式安装包及内含 geodata；API 下载失败时尝试官方 Release 地址；acme.sh 使用官方源码，申请 Let's Encrypt ECC 证书。
+- Xray 使用 XTLS 官方 `install-release.sh` 的默认在线 `install` 流程，由官方脚本自动识别架构、选择稳定版、下载并校验安装包、安装 Xray 和 geodata。封装仅增加 `--manually-restart-later`，待 XHTTP 配置校验通过后统一启动；acme.sh 使用官方源码，申请 Let's Encrypt ECC 证书。
 - UUID 与 XHTTP 路径分别随机生成，不复用原文中的示例凭据。可用 `--uuid`、`--path` 指定自己的值。
 - Xray 仅监听回环地址，通过非 root 服务用户运行；私钥与连接信息仅 root 可读，错误日志进入 journald，不开启 Xray 访问日志。
 - 保留原文的私网、`geoip:cn` 和广告域名阻断规则。因此通过该节点访问中国大陆 IP 可能被阻断；如需调整，编辑 Xray 配置后先校验再重启。
@@ -107,6 +107,32 @@ sudo systemctl restart xray
 sudo systemctl reload nginx
 ```
 
+## 一键移除
+
+**以下命令会停止并移除这套部署，包括 Nginx、Xray、站点、证书和续期任务。** 已有连接会中断。先获取新版脚本：
+
+```bash
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.1.0/install-xray.sh -o install-xray.sh
+```
+
+可先预览移除检查与操作范围：
+
+```bash
+sudo bash install-xray.sh --uninstall --dry-run
+```
+
+执行一键移除：
+
+```bash
+sudo bash install-xray.sh --uninstall
+```
+
+移除前会将安装目录、原始备份、Nginx 配置、站点、证书、客户端凭据、Xray 程序/配置/geodata/日志及相关 unit、软件源文件归档到 `/var/backups/xray-nginx/uninstall-XXXXXXXX.tar.gz`。备份目录权限为 `0700`，归档权限为 `0600`，包含私钥及连接凭据，请妥善保存。备份完成并校验归档可读取后，才停止服务并执行移除；备份保留供人工恢复。
+
+Xray 使用缓存的官方安装脚本执行 `remove --purge`；未缓存安装器的旧版本先下载官方脚本，下载失败时不停止服务。Nginx 通过 apt purge 移除，仅允许 apt 删除 `nginx` 包本身；本脚本专属的网站、证书、续期 unit 和软件源一并清理。不执行 autoremove，保留公共依赖、系统账户、DNS、SSH 和云防火墙规则。
+
+若发现其他 Nginx 站点或配置修改、其他 Xray 配置/实例、共享 logrotate 模板、目录链接或 apt 连带删除计划，会在停止服务前拒绝执行。只有本脚本新部署及保有原始 Nginx 备份的旧版部署可自动移除。发生错误时立即停止后续操作、保留备份并输出位置；重复执行已完成的移除会提示无需处理。
+
 ## 预览与失败处理
 
 Mac 或 Linux 上可以只生成配置预览，不安装软件、不写部署文件，需要 `python3`：
@@ -121,10 +147,10 @@ bash install-xray.sh --dry-run --domain proxy.example.com --email admin@example.
 
 发生错误时，脚本会保留原始失败退出码，清理自身临时目录，停止本次安装的 Xray 和已经启用的续期 timer，并尝试恢复 Nginx 默认站点。**这不等于完整卸载：已安装软件包、软件源、证书账户和排查文件会保留。** Nginx 的备份是安装官方包后、替换站点前的配置。
 
-默认重跑会拒绝覆盖已有文件。若旧版在“部署 html.rar 站点资源”时因 HTTP 504 等下载错误退出，可使用 v1.0.2 的专用续装入口（替换域名和邮箱）：
+默认重跑会拒绝覆盖已有文件。若旧版在“部署 html.rar 站点资源”时因 HTTP 504 等下载错误退出，可使用 v1.1.0 的专用续装入口（替换域名和邮箱）：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.0.2/install-xray.sh -o install-xray.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.1.0/install-xray.sh -o install-xray.sh
 sudo bash install-xray.sh --resume-site-download \
   --domain proxy.example.com --email admin@example.com
 ```
@@ -141,6 +167,10 @@ sudo bash install-xray.sh --resume-site-download \
 
 新增故障测试覆盖主链路失败自动切换、双链路失败保留退出码及拒绝写入、续装阶段顺序，以及拒绝已有证书、ACME、网站内容、链接或配置改动。已在用户 Ubuntu 24.04 服务器上复现 Release HTTP 504，确认 Raw HTTP 200、资源校验通过，且专用续装前置检查通过。
 
-新增测试覆盖官方元数据按 amd64/arm64 选择安装包、API 失败后回退、拒绝缺失或不符的摘要及非官方地址。
+v1.1.0 恢复官方默认在线安装，移除封装层的 Xray API 选包、下载、摘要校验及 `--local` 安装逻辑。官方安装脚本先下载到临时文件，HTTP 下载失败或 Bash 语法检查失败时停止，避免将错误页面作为脚本执行。保留官方安装器退出码；后续配置校验通过后再启用服务。已验证官方脚本及安装包地址恢复可用；已有生产服务不重复安装。
+
+新增移除功能已在真实 Ubuntu 的隔离 chroot 中验证完整移除、备份内容与权限、无写入预览、重复移除、旧版兼容、网络/apt 失败和共享资源保护；apt、systemd 与官方卸载器在该隔离测试中使用替身，真实 tar 和文件清理在隔离目录执行。已在现有生产部署上完成只读移除预览，未执行生产卸载。
+
+可在 Linux 上以 root 运行隔离回归测试：`sudo python3 tests/test_uninstall.py`。测试为 systemd、apt 和官方卸载器提供替身，所有删除发生在临时 chroot 内，不操作宿主服务。
 
 相关官方项目：[Nginx 软件源](https://nginx.org/en/linux_packages.html)、[Xray-install](https://github.com/XTLS/Xray-install)、[acme.sh](https://github.com/acmesh-official/acme.sh)。

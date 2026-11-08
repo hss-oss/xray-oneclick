@@ -10,6 +10,9 @@ CLIENT_UUID=''
 XHTTP_PATH=''
 DRY_RUN=0
 RESUME_SITE_DOWNLOAD=0
+UNINSTALL=0
+UNINSTALL_NOTHING=0
+REMOVE_NGINX_PACKAGE=0
 SITE_URL=https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.0.0/assets/xray-site.tar.gz
 SITE_FALLBACK_URL=https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.0/xray-site.tar.gz
 SITE_SHA256=bc152def1c5e4527809a27eb7fed7802cc4abf19bb99a07cfb15d595bc470202
@@ -35,6 +38,7 @@ usage() {
   --email you@example.com    ACME 注册邮箱
   --uuid UUID               客户端 UUID；默认随机生成
   --path /random-path       XHTTP 路径；默认独立随机生成
+  --uninstall               备份后移除本脚本部署（可配合 --dry-run 预览）
   --resume-site-download    仅续装：上次在站点资源下载阶段失败
   --dry-run                 仅输出配置，不安装、不写文件（需要 python3）
   -h, --help                显示帮助
@@ -57,6 +61,7 @@ parse_args() {
           --path) XHTTP_PATH=$2;;
         esac
         shift 2;;
+      --uninstall) UNINSTALL=1; shift;;
       --resume-site-download) RESUME_SITE_DOWNLOAD=1; shift;;
       --dry-run) DRY_RUN=1; shift;;
       -h|--help) usage; exit 0;;
@@ -229,10 +234,8 @@ PY
 )
 
 download() {
-  local url=$1 destination=$2
-  shift 2
   curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 "$@" --output "$destination" "$url"
+    --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 --output "$2" "$1"
 }
 
 cleanup() {
@@ -319,8 +322,14 @@ preflight() {
   [[ $(dpkg --print-architecture) =~ ^(amd64|arm64)$ ]] || die '仅支持 amd64/arm64'
   [[ -d /run/systemd/system ]] || die '需要正在运行的 systemd（不支持普通 Docker 容器）'
   command -v flock >/dev/null || die '缺少 flock，请先安装 util-linux'
-  exec 9>/run/lock/xray-nginx-install.lock
-  flock -n 9 || die '已有安装进程正在运行'
+  if [[ $DRY_RUN == 0 ]]; then
+    exec 9>/run/lock/xray-nginx-install.lock
+    flock -n 9 || die '已有安装或移除进程正在运行'
+  fi
+  if [[ $UNINSTALL == 1 ]]; then
+    check_uninstall
+    return
+  fi
   if [[ $RESUME_SITE_DOWNLOAD == 1 ]]; then
     check_site_download_resume
     return
@@ -434,55 +443,13 @@ install_certificate() {
     --reloadcmd 'nginx -t && systemctl reload nginx'
 }
 
-# 使用官方 Release 元数据中的 SHA-256；API 直链可避开部分地区的网页下载 504。
-prepare_xray_archive() {
-  download https://api.github.com/repos/XTLS/Xray-core/releases/latest "$TEMP_DIR/xray-release.json"
-  python3 - "$TEMP_DIR/xray-release.json" "$(dpkg --print-architecture)" > "$TEMP_DIR/xray-release.txt" <<'PYXRAY'
-import json, re, sys
-from pathlib import Path
-release = json.loads(Path(sys.argv[1]).read_text())
-name = {'amd64': 'Xray-linux-64.zip', 'arm64': 'Xray-linux-arm64-v8a.zip'}[sys.argv[2]]
-asset = next((a for a in release.get('assets', []) if a['name'] == name), None)
-version = release.get('tag_name', '')
-if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'v[0-9]+(?:\.[0-9]+)+', version):
-    raise SystemExit('Xray 官方稳定版元数据不合法')
-if not asset or not re.fullmatch(r'sha256:[0-9a-f]{64}', asset.get('digest') or ''):
-    raise SystemExit('Xray 官方附件缺少可验证的 SHA-256')
-api_url, browser_url = asset.get('url', ''), asset.get('browser_download_url', '')
-if not re.fullmatch(r'https://api\.github\.com/repos/XTLS/Xray-core/releases/assets/[0-9]+', api_url):
-    raise SystemExit('Xray API 附件地址不合法')
-if browser_url != f'https://github.com/XTLS/Xray-core/releases/download/{version}/{name}':
-    raise SystemExit('Xray Release 附件地址不合法')
-print(version, api_url, browser_url, asset['digest'][7:], sep='\n')
-PYXRAY
-  local version api_url browser_url digest
-  {
-    read -r version
-    read -r api_url
-    read -r browser_url
-    read -r digest
-  } < "$TEMP_DIR/xray-release.txt"
-  info "下载并校验官方 Xray $version"
-  if ! download "$api_url" "$TEMP_DIR/xray.zip" -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28'; then
-    info '官方 API 下载失败，尝试官方 Release 地址'
-    download "$browser_url" "$TEMP_DIR/xray.zip" || return "$?"
-  fi
-  python3 - "$TEMP_DIR/xray.zip" "$digest" <<'PYHASH'
-import hashlib, sys
-from pathlib import Path
-if hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() != sys.argv[2]:
-    raise SystemExit('Xray 安装包 SHA-256 校验失败，停止安装')
-print('Xray 官方安装包 SHA-256 校验通过')
-PYHASH
-}
-
 install_xray() {
   info '调用 XTLS 官方安装脚本安装 Xray 和 geodata'
-  download https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh "$TEMP_DIR/xray-install.sh"
+  download https://github.com/XTLS/Xray-install/raw/main/install-release.sh "$TEMP_DIR/xray-install.sh"
   bash -n "$TEMP_DIR/xray-install.sh"
-  prepare_xray_archive
+  install -m 600 "$TEMP_DIR/xray-install.sh" "$BASE/xray-install-release.sh"
   XRAY_INSTALLED=1
-  bash "$TEMP_DIR/xray-install.sh" install --local "$TEMP_DIR/xray.zip" --manually-restart-later
+  bash "$TEMP_DIR/xray-install.sh" install --manually-restart-later
   [[ -x /usr/local/bin/xray ]] || die 'Xray 安装未生成可执行文件'
   local service_user service_group
   service_user=$(systemctl show xray -p User --value)
@@ -540,8 +507,157 @@ PY
   chmod 600 "$BASE/client.txt"
 }
 
+# 识别本脚本的新部署或旧版备份；共享实例/配置须人工处理。
+check_uninstall() {
+  if [[ ! -e $BASE && ! -L $BASE && ! -e $WEB_ROOT && ! -L $WEB_ROOT && ! -e $CERT_DIR && ! -L $CERT_DIR && ! -e $NGINX_CONF && ! -L $NGINX_CONF && ! -e /etc/apt/sources.list.d/xray-nginx.list ]]; then
+    UNINSTALL_NOTHING=1
+    return
+  fi
+  command -v python3 >/dev/null || die '移除检查需要 python3'
+  python3 - "$BASE" "$WEB_ROOT" "$CERT_DIR" <<'PYUNINSTALL'
+import json, os, sys
+from pathlib import Path
+base, web, cert = map(Path, sys.argv[1:])
+def reject(reason):
+    raise SystemExit('拒绝移除：' + reason)
+# 拒绝受管目录及其父目录被重定向；归档和删除均只处理预期路径。
+for path in (base, web, cert, Path('/etc/nginx'), Path('/usr/local/etc/xray'),
+             Path('/usr/local/share/xray'), Path('/var/log/xray'), Path('/var/log/nginx'),
+             Path('/var/cache/nginx'), Path('/var/backups/xray-nginx')):
+    if path.resolve() != path:
+        reject(f'目录或父目录包含链接：{path}')
+backup = base / 'backup/nginx'
+if not (backup / 'nginx.conf').is_file() or backup.resolve() != backup:
+    reject('找不到本脚本安装前的 Nginx 备份')
+def inventory(root):
+    result = {}
+    for path in root.rglob('*'):
+        key = path.relative_to(root).as_posix()
+        if path.is_symlink(): result[key] = ('link', os.readlink(path))
+        elif path.is_dir(): result[key] = ('dir',)
+        elif path.is_file(): result[key] = ('file', path.read_bytes())
+        else: reject(f'不支持的文件类型：{path}')
+    return result
+current, original = inventory(Path('/etc/nginx')), inventory(backup)
+managed = current.pop('conf.d/xray-nginx.conf', None)
+if managed and (managed[0] != 'file' or not managed[1].startswith('# 由 install-xray.sh 管理'.encode())):
+    reject('Nginx 站点不是本脚本生成的配置')
+for name, value in current.items():
+    if original.get(name) != value:
+        reject(f'Nginx 存在新增或修改的配置：{name}')
+if set(original) - set(current) - {'conf.d/default.conf', 'sites-enabled/default'}:
+    reject('Nginx 配置结构与原始备份不符')
+xray_dir = Path('/usr/local/etc/xray')
+if xray_dir.exists():
+    if any(p.name != 'config.json' or not p.is_file() or p.is_symlink() for p in xray_dir.iterdir()):
+        reject('发现其他 Xray 配置文件或链接')
+    config = xray_dir / 'config.json'
+    if config.exists():
+        data = json.loads(config.read_text())
+        inbounds = data.get('inbounds', [])
+        if (len(inbounds) != 1 or inbounds[0].get('listen') != '127.0.0.1'
+                or inbounds[0].get('port') != 8443 or inbounds[0].get('protocol') != 'vless'
+                or inbounds[0].get('streamSettings', {}).get('network') != 'xhttp'):
+            reject('Xray 不是本脚本的单实例 XHTTP 配置')
+for path in Path('/etc/systemd/system/xray.service.d').glob('*'):
+    if path.name != '10-donot_touch_single_conf.conf':
+        reject('发现自定义 Xray systemd 配置')
+for name in ('logrotate@.service', 'logrotate@.timer'):
+    path = Path('/etc/systemd/system') / name
+    if path.exists() or path.is_symlink():
+        reject('发现可能共享的 logrotate 模板，请先人工处理')
+print('移除归属检查通过')
+PYUNINSTALL
+  [[ -z $(systemctl list-units --all --plain --no-legend 'xray@*.service') ]] || die '发现其他 Xray 实例，拒绝移除'
+  local package_state
+  package_state=$(dpkg-query -W -f='${db:Status-Status}' nginx 2>/dev/null || true)
+  if [[ $package_state == installed || $package_state == config-files ]]; then
+    REMOVE_NGINX_PACKAGE=1
+    # 仅允许移除 nginx 本身；若 apt 计划连带移除别的软件则停止。
+    apt-get -s purge nginx | python3 -c 'import sys
+for line in sys.stdin:
+    parts = line.split()
+    if parts and parts[0] in ("Remv", "Purg") and parts[1].split(":")[0] != "nginx":
+        raise SystemExit("拒绝移除：apt 计划连带删除 " + parts[1])'
+  fi
+}
+
+uninstall_cleanup() {
+  local status=$?
+  trap - EXIT
+  [[ -z $TEMP_DIR ]] || rm -rf -- "$TEMP_DIR"
+  if [[ $status != 0 ]]; then
+    printf '\n移除未完成，请根据错误继续排查。完整备份：%s\n' "${BACKUP:-尚未创建；未执行移除}" >&2
+  fi
+  exit "$status"
+}
+
+uninstall_deployment() {
+  if [[ $UNINSTALL_NOTHING == 1 ]]; then
+    info '未发现本脚本的部署，无需移除'
+    return
+  fi
+  if [[ $DRY_RUN == 1 ]]; then
+    info '仅预览：归档配置/证书/站点/程序；停止服务和续期任务；官方 remove --purge 移除 Xray；移除 Nginx 包和本部署文件。'
+    info '备份保存在 /var/backups/xray-nginx/；公共依赖包和系统账户保留。'
+    return
+  fi
+  TEMP_DIR=$(mktemp -d /tmp/xray-nginx-remove.XXXXXXXX)
+  trap uninstall_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local remove_xray=0 path unit paths=()
+  if [[ -e /usr/local/bin/xray || -e /etc/systemd/system/xray.service ]]; then
+    remove_xray=1
+    # 新安装缓存官方安装器，移除时无需网络；兼容未缓存安装器的旧版。
+    if [[ -f $BASE/xray-install-release.sh && ! -L $BASE/xray-install-release.sh ]]; then
+      cp "$BASE/xray-install-release.sh" "$TEMP_DIR/xray-install.sh"
+    else
+      download https://github.com/XTLS/Xray-install/raw/main/install-release.sh "$TEMP_DIR/xray-install.sh"
+    fi
+    bash -n "$TEMP_DIR/xray-install.sh"
+  fi
+  install -d -m 700 /var/backups/xray-nginx
+  BACKUP=$(mktemp /var/backups/xray-nginx/uninstall-XXXXXXXX.tar.gz)
+  for path in "$BASE" "$WEB_ROOT" "$CERT_DIR" /etc/nginx /var/log/nginx /var/cache/nginx \
+    /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
+    /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+    /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
+    /etc/systemd/system/xray-acme-renew.service /etc/systemd/system/xray-acme-renew.timer \
+    /etc/apt/sources.list.d/xray-nginx.list /etc/apt/preferences.d/xray-nginx /usr/share/keyrings/xray-nginx.gpg; do
+    [[ ! -e $path && ! -L $path ]] || paths+=("${path#/}")
+  done
+  tar -czf "$BACKUP" -C / -- "${paths[@]}"
+  tar -tzf "$BACKUP" >/dev/null
+  info "移除前的完整备份：$BACKUP（仅 root 可读，含证书和连接凭据）"
+  for unit in xray-acme-renew.timer xray-acme-renew.service nginx.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      systemctl stop "$unit"
+      [[ $unit == xray-acme-renew.service ]] || systemctl disable "$unit"
+    fi
+  done
+  if [[ $remove_xray == 1 ]]; then
+    DAT_PATH=/usr/local/share/xray JSON_PATH=/usr/local/etc/xray JSONS_PATH='' \
+      bash "$TEMP_DIR/xray-install.sh" remove --purge
+  fi
+  if [[ $REMOVE_NGINX_PACKAGE == 1 ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 purge -y nginx
+  fi
+  rm -f -- /etc/systemd/system/xray-acme-renew.{service,timer} \
+    /etc/apt/sources.list.d/xray-nginx.list /etc/apt/preferences.d/xray-nginx /usr/share/keyrings/xray-nginx.gpg
+  rm -rf -- "$BASE" "$WEB_ROOT" "$CERT_DIR" /etc/nginx /var/log/nginx /var/cache/nginx
+  systemctl daemon-reload
+  info "移除完成。完整备份保存在 $BACKUP；公共依赖包、系统账户和云防火墙规则保留。"
+}
+
 main() {
   parse_args "$@"
+  if [[ $UNINSTALL == 1 ]]; then
+    [[ $RESUME_SITE_DOWNLOAD == 0 && ${#DOMAINS[@]} == 0 && -z $EMAIL && -z $CLIENT_UUID && -z $XHTTP_PATH ]] || die '--uninstall 仅可与 --dry-run 配合使用'
+    preflight
+    uninstall_deployment
+    return
+  fi
   if [[ $DRY_RUN == 1 ]]; then
     command -v python3 >/dev/null || die '--dry-run 需要 python3'
     collect_inputs
