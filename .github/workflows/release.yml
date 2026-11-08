@@ -1,0 +1,31 @@
+name: Publish release assets
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash -n install-xray.sh
+          (cd assets && sha256sum --check --ignore-missing SHA256SUMS)
+          shasum -a 256 -c <(awk '$2 == "install-xray.sh"' assets/SHA256SUMS)
+          gh release create "$RELEASE_TAG" \
+            install-xray.sh assets/html.rar assets/xray-site.tar.gz assets/SHA256SUMS \
+            --verify-tag --title "$RELEASE_TAG - Xray XHTTP 一键安装" \
+            --notes-file RELEASE_NOTES.md
