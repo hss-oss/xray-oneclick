@@ -229,8 +229,10 @@ PY
 )
 
 download() {
+  local url=$1 destination=$2
+  shift 2
   curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 --output "$2" "$1"
+    --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 "$@" --output "$destination" "$url"
 }
 
 cleanup() {
@@ -432,12 +434,55 @@ install_certificate() {
     --reloadcmd 'nginx -t && systemctl reload nginx'
 }
 
+# 使用官方 Release 元数据中的 SHA-256；API 直链可避开部分地区的网页下载 504。
+prepare_xray_archive() {
+  download https://api.github.com/repos/XTLS/Xray-core/releases/latest "$TEMP_DIR/xray-release.json"
+  python3 - "$TEMP_DIR/xray-release.json" "$(dpkg --print-architecture)" > "$TEMP_DIR/xray-release.txt" <<'PYXRAY'
+import json, re, sys
+from pathlib import Path
+release = json.loads(Path(sys.argv[1]).read_text())
+name = {'amd64': 'Xray-linux-64.zip', 'arm64': 'Xray-linux-arm64-v8a.zip'}[sys.argv[2]]
+asset = next((a for a in release.get('assets', []) if a['name'] == name), None)
+version = release.get('tag_name', '')
+if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'v[0-9]+(?:\.[0-9]+)+', version):
+    raise SystemExit('Xray 官方稳定版元数据不合法')
+if not asset or not re.fullmatch(r'sha256:[0-9a-f]{64}', asset.get('digest') or ''):
+    raise SystemExit('Xray 官方附件缺少可验证的 SHA-256')
+api_url, browser_url = asset.get('url', ''), asset.get('browser_download_url', '')
+if not re.fullmatch(r'https://api\.github\.com/repos/XTLS/Xray-core/releases/assets/[0-9]+', api_url):
+    raise SystemExit('Xray API 附件地址不合法')
+if browser_url != f'https://github.com/XTLS/Xray-core/releases/download/{version}/{name}':
+    raise SystemExit('Xray Release 附件地址不合法')
+print(version, api_url, browser_url, asset['digest'][7:], sep='\n')
+PYXRAY
+  local version api_url browser_url digest
+  {
+    read -r version
+    read -r api_url
+    read -r browser_url
+    read -r digest
+  } < "$TEMP_DIR/xray-release.txt"
+  info "下载并校验官方 Xray $version"
+  if ! download "$api_url" "$TEMP_DIR/xray.zip" -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28'; then
+    info '官方 API 下载失败，尝试官方 Release 地址'
+    download "$browser_url" "$TEMP_DIR/xray.zip" || return "$?"
+  fi
+  python3 - "$TEMP_DIR/xray.zip" "$digest" <<'PYHASH'
+import hashlib, sys
+from pathlib import Path
+if hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() != sys.argv[2]:
+    raise SystemExit('Xray 安装包 SHA-256 校验失败，停止安装')
+print('Xray 官方安装包 SHA-256 校验通过')
+PYHASH
+}
+
 install_xray() {
   info '调用 XTLS 官方安装脚本安装 Xray 和 geodata'
   download https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh "$TEMP_DIR/xray-install.sh"
   bash -n "$TEMP_DIR/xray-install.sh"
+  prepare_xray_archive
   XRAY_INSTALLED=1
-  bash "$TEMP_DIR/xray-install.sh" install --manually-restart-later
+  bash "$TEMP_DIR/xray-install.sh" install --local "$TEMP_DIR/xray.zip" --manually-restart-later
   [[ -x /usr/local/bin/xray ]] || die 'Xray 安装未生成可执行文件'
   local service_user service_group
   service_user=$(systemctl show xray -p User --value)

@@ -3,7 +3,7 @@
 面向尚未安装 Nginx/Xray 的 Debian/Ubuntu 服务器，支持 amd64/arm64 和 systemd。
 
 ```bash
-curl -fL --retry 3 https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.1/install-xray.sh -o install-xray.sh && sudo bash install-xray.sh
+curl -fL --retry 3 https://github.com/hss-oss/xray-oneclick/releases/download/v1.0.2/install-xray.sh -o install-xray.sh && sudo bash install-xray.sh
 ```
 
 - 安装 Nginx mainline、Xray VLESS/XHTTP 和 acme.sh。
@@ -12,6 +12,9 @@ curl -fL --retry 3 https://github.com/hss-oss/xray-oneclick/releases/download/v1
 - 安装成功后将 VLESS/XHTTP 链接保存到 `/opt/xray-nginx/client.txt`。
 
 本次修复：
+
+- Xray 安装包优先通过 GitHub 官方 API 下载并核对官方 SHA-256，再交给官方安装器 `--local` 安装，避免官方安装器的 Release 网页下载同样遭遇 504。
+- 已在真实 Ubuntu 24.04 服务器续装，完成生产证书签发和服务启动。
 
 - 针对 GitHub Release HTTP 504，优先使用固定版本的 GitHub Raw 资源，并保留 Release 备用链路和固定 SHA-256 校验。
 - 新增 `--resume-site-download`，可从旧版站点下载失败后的状态续装；严格检查备份一致且未进入证书/Xray 步骤，不覆盖已有业务。
