@@ -17,6 +17,8 @@ certificate_ready() { return 0; }
 install_certificate() { printf 'unexpected-certificate\\n' >> "$LOG"; return 99; }
 install_dependencies() { printf 'unexpected-dependencies\\n' >> "$LOG"; return 98; }
 install_xray() { printf 'xray\\n' >> "$LOG"; if [[ $MODE == fail ]]; then return 77; fi; }
+# 已安装 Xray 的宿主机可能走配置分支，同样使用替身，避免读取或修改业务配置。
+configure_xray() { install_xray; }
 render_nginx() { printf 'mock nginx'; }
 nginx() { :; }
 systemctl() { :; }
@@ -26,6 +28,7 @@ ss() { :; }
 enable_renewal() { printf 'renewal\\n' >> "$LOG"; }
 write_client_info() { printf 'client\\n' >> "$LOG"; }
 NGINX_CONF=$BASE/test-nginx.conf
+XRAY_CONF=$BASE/test-xray.json
 HTTP3=0
 IPV6=0
 main --resume

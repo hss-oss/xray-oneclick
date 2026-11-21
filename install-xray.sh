@@ -93,6 +93,7 @@ validate_inputs() {
   [[ $EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die '请填写有效的 --email'
   [[ $CLIENT_UUID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die 'UUID 格式错误'
   [[ $XHTTP_PATH =~ ^/[A-Za-z0-9_-]{1,100}$ ]] || die '路径必须为 / 开头的单段字母、数字、下划线或短横线'
+  [[ $XHTTP_PATH != /view ]] || die '/view 已保留给静态站点，请使用其他 XHTTP 路径'
 }
 
 new_uuid() {
@@ -120,10 +121,41 @@ collect_inputs() {
   validate_inputs
 }
 
+render_sub2api_proxy() {
+  cat <<'EOF'
+        # 网页和 API 共用本机后端；保留请求来源及 WebSocket 升级信息。
+        proxy_pass http://127.0.0.1:3500;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $sub2api_connection_upgrade;
+
+        # 及时转发 SSE；读写超时指相邻两次 I/O 操作之间的等待时间。
+        proxy_buffering off;
+        proxy_cache off;
+        client_max_body_size 256m;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_connect_timeout 75s;
+EOF
+}
+
 render_nginx() {
   local tls=${1:-0} http3=${2:-0} ipv6=${3:-0}
   cat <<EOF
 # 由 install-xray.sh 管理；HTTP 保持在前，用于 ACME webroot 验证。
+# 本文件由 nginx.conf 的 http 块加载，保留 session_id 等下划线请求头。
+underscores_in_headers on;
+
+# 仅在客户端请求协议升级时发送 Connection: upgrade。
+map \$http_upgrade \$sub2api_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
 $(if [[ $ipv6 == 1 ]]; then printf '    listen [::]:80;'; fi)
@@ -166,7 +198,23 @@ $(if [[ $http3 == 1 ]]; then
         grpc_set_header Host \$host;
         grpc_set_header X-Forwarded-For \$remote_addr;
     }
-    location / { try_files \$uri \$uri/ =404; }
+
+    # 只有首页在后端不可用时跳转；业务 API 保留原始错误响应。
+    location = / {
+$(render_sub2api_proxy)
+        proxy_intercept_errors on;
+        error_page 502 503 504 =302 https://\$host/view/;
+    }
+
+    # 静态站点及相对路径资源直接提供，无需安装或启动 Sub2API。
+    location ^~ /view/ {
+        alias $WEB_ROOT/;
+        index index.html;
+    }
+
+    location / {
+$(render_sub2api_proxy)
+    }
 }
 EOF
 }
@@ -981,7 +1029,7 @@ main() {
   nginx -t
   systemctl reload nginx
   # 校验证书及本机 HTTPS 页面；保留完整证书验证，不使用 -k。
-  curl --fail --silent --show-error --noproxy '*' --connect-timeout 10 --max-time 20 \
+  curl --fail --location --silent --show-error --noproxy '*' --connect-timeout 10 --max-time 20 \
     --resolve "${DOMAINS[0]}:443:127.0.0.1" "https://${DOMAINS[0]}/" >/dev/null
   systemctl is-active --quiet nginx xray
   save_install_state https

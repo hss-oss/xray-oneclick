@@ -39,7 +39,9 @@ sudo bash install-xray.sh \
 
 ```text
 客户端 → TLS/HTTP2（TCP 443）→ Nginx → XHTTP/VLESS → Xray（127.0.0.1:8443）
-浏览器 → HTTP/HTTPS/HTTP3 → html.rar 中的 Photosec 摄影网站
+浏览器 → HTTPS/HTTP3 首页 → Sub2API（127.0.0.1:3500）
+                       └→ 后端不可用：302 跳转 /view/ → Photosec 静态网站
+浏览器 → HTTP（TCP 80）或 HTTPS /view/ → Photosec 静态网站
 ACME → HTTP（TCP 80）→ /.well-known/acme-challenge/
 ```
 
@@ -51,7 +53,9 @@ ACME → HTTP（TCP 80）→ /.well-known/acme-challenge/
 - 安装每天检查证书续期的 systemd timer；证书更新后先执行 `nginx -t`，通过后 reload。
 - 原始 `html.rar` 保存在 [v1.0.0 Release](https://github.com/hss-oss/xray-oneclick/releases/tag/v1.0.0) 的附件中。脚本优先从 GitHub Raw 下载固定 `v1.0.0` 资源，失败时切换至该 Release 的 `xray-site.tar.gz`，校验固定的 SHA-256 后，将 `html/` 内的页面、CSS、JS、字体和图片部署到 `/var/www/xray-nginx/`。不需要手动下载附件或安装 RAR 解压软件。
 - 若脚本同目录已有 `xray-site.tar.gz`，优先使用该文件并执行相同的校验；可用来离线部署站点资源。其他系统组件安装仍需网络。
-- HTTP 和 HTTPS 均使用该站点目录，`index.html` 直接位于目录根部；保留 `.well-known/acme-challenge/`，不影响证书签发及续期。
+- HTTP 继续提供静态站点及 `.well-known/acme-challenge/`，不影响证书签发及续期。HTTPS 首页优先代理 `127.0.0.1:3500`；后端不可用或返回 502/503/504 时，浏览器跳转到当前域名的 `/view/`，该路径直接提供静态页面及其 CSS、JS、图片和字体。后端恢复后重新访问 `/` 即可进入 Sub2API；其他业务 API 不会跳转到静态页面。
+- Sub2API、PostgreSQL 和 Redis 需要另行安装；没有部署 Sub2API 时也可直接使用静态首页。代理保留下划线请求头（如 `session_id`），按请求映射 WebSocket 升级头，并关闭响应缓冲和缓存以支持 SSE；上传上限 256 MB，读写空闲超时 600 秒。
+- `/view` 为静态站点保留路径，不能作为 `--path` 的 XHTTP 路径。站点配置顶部的 `map` 和 `underscores_in_headers` 由 Nginx 的 `http` 块加载，不需要修改主配置。
 - 分发前移除了原模板的 Google Maps API key 及对应加载脚本，保留模板署名和其余页面。原有字体及 OwlCarousel CDN 引用仍按模板保留，网站文件的原编码与换行保持不变。
 
 ## 旧版安装补装页面
@@ -66,7 +70,7 @@ sudo cp -a /var/www/xray-nginx "/opt/xray-nginx/backup/site-before-update-$(date
 sudo bash -c 'source ./install-xray.sh; install_site'
 ```
 
-完成后访问自己的 HTTPS 域名，应显示 Photosec 摄影网站。静态文件更新无需 reload Nginx；浏览器若仍显示旧首页，请刷新缓存。
+完成后应显示 Photosec 摄影网站：旧版静态 Nginx 配置访问 `/`，启用新版代理配置后访问 `/view/`。此操作只补装页面，不更新 Nginx 路由；静态文件更新无需 reload Nginx，浏览器若仍显示旧首页，请刷新缓存。
 
 ## 查看连接与管理服务
 
@@ -112,7 +116,7 @@ sudo systemctl reload nginx
 **以下命令会停止并移除这套部署，包括 Nginx、Xray、站点、证书和续期任务。** 已有连接会中断。先获取新版脚本：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.2.0/install-xray.sh -o install-xray.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/main/install-xray.sh -o install-xray.sh
 ```
 
 可先预览移除检查与操作范围：
@@ -150,7 +154,7 @@ bash install-xray.sh --dry-run --domain proxy.example.com --email admin@example.
 默认重跑仍会拒绝覆盖已有部署。中断后使用通用续装入口：
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/v1.2.0/install-xray.sh -o install-xray.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/hss-oss/xray-oneclick/main/install-xray.sh -o install-xray.sh
 sudo bash install-xray.sh --resume
 ```
 
@@ -192,6 +196,8 @@ sudo bash install-xray.sh --resume --domain proxy.example.com --email admin@exam
 新增移除功能已在真实 Ubuntu 的隔离 chroot 中验证完整移除、备份内容与权限、无写入预览、重复移除、旧版兼容、网络/apt 失败和共享资源保护；apt、systemd 与官方卸载器在该隔离测试中使用替身，真实 tar 和文件清理在隔离目录执行。已在现有生产部署上完成只读移除预览，未执行生产卸载。
 
 普通回归测试：`python3 tests/test_official_first.py`、`python3 tests/test_xray_download.py`、`python3 tests/test_resume.py`。
+
+代理及兜底回归测试：`python3 tests/test_nginx_proxy.py`。有 Nginx 和 OpenSSL 时会使用临时端口与测试证书，实际验证下划线请求头、WebSocket 升级头、首页故障跳转、离线静态资源及 API 错误不跳转；不停止或重载宿主机服务。未安装 Nginx 时只执行配置生成及参数校验。
 
 可在 Linux 上以 root 运行隔离回归测试：`sudo python3 tests/test_uninstall.py`。测试为 systemd、apt 和官方卸载器提供替身，所有删除发生在临时 chroot 内，不操作宿主服务。
 
